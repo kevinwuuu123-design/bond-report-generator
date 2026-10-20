@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import ReactDOM from 'react-dom/client'
 import './styles.css'
 import FieldGrid from './components/FieldGrid'
@@ -6,6 +6,11 @@ import { emptyFields, parseBondText } from './parser/parseBondText'
 import type { BondFields, ParseMeta } from './types/bond'
 import { calculateArchiveDates, defaultOverrides, inferBookDateDetailed, type WorkdayOverrides } from './utils/date'
 import { conditionalMissingFields, generateInternalReport, requiredFieldLabels, reviewFieldLabels } from './templates/internalReport'
+import ArchivePanel from './components/ArchivePanel'
+import CloudPanel from './components/CloudPanel'
+import { useArchiveStore } from './hooks/useArchiveStore'
+import { createRecord, downloadBlob, recordStorageKey } from './utils/records'
+import type { BondRecord } from './types/record'
 
 const sample = `【26莫控MTN006 发行簿记结果】
 债券代码：102683240.IB
@@ -41,6 +46,19 @@ function App() {
   const [personnel, setPersonnel] = useState<PersonnelHistory>(loadPersonnel())
   const [copied, setCopied] = useState(false)
   const [parsedOnce, setParsedOnce] = useState(false)
+  const store = useArchiveStore()
+  const [notice,setNotice] = useState('')
+  const [sourceId,setSourceId] = useState<string | undefined>()
+  const [savedSignature,setSavedSignature] = useState('')
+  const signature = JSON.stringify({ fields,raw,overrides,owner:store.owner })
+  const saved = savedSignature === signature
+  const lastOwner=useRef(store.owner)
+  useEffect(()=>{
+    if(lastOwner.current===store.owner) return
+    lastOwner.current=store.owner
+    setRaw('');setFields({...emptyFields});setMeta({inferred:new Set(),notes:[],dateConfidence:{}});setParsedOnce(false);setSourceId(undefined);setSavedSignature('')
+    setNotice('已切换存储账号并清空工作表单。已归档记录可在相应台账中查看。')
+  },[store.owner])
 
   const conditionalMissing = useMemo(() => conditionalMissingFields(fields), [fields])
   const requiredMissingItems = useMemo(() => {
@@ -63,8 +81,9 @@ function App() {
   const hasEstimated = Object.values(meta.dateConfidence).some(v => v === 'estimated')
 
   const parse = () => {
+    if (parsedOnce && !saved && !window.confirm('重新解析会替换当前表单，未归档内容将被覆盖。继续解析？')) return
     const r = parseBondText(raw, overrides)
-    setFields(r.fields); setMeta(r.meta); setParsedOnce(true)
+    setFields(r.fields); setMeta(r.meta); setParsedOnce(true); setSavedSignature(''); setSourceId(undefined); setNotice('')
   }
 
   const update = (key: keyof BondFields, value: string) => {
@@ -103,30 +122,58 @@ function App() {
       setMeta(m => ({ ...m, dateConfidence: { ...m.dateConfidence, archiveSubmitDate: d.submitConfidence, archiveFinishDate: d.finishConfidence } }))
     }
   }
-  const saveOverrides = () => { localStorage.setItem('workdayOverridesV2', JSON.stringify(overrides)); recalcCalendar(overrides) }
+  const saveOverrides = () => { try { localStorage.setItem('workdayOverridesV2', JSON.stringify(overrides)); recalcCalendar(overrides); setNotice('工作日日历已保存。') } catch { setNotice('工作日日历保存失败，请检查浏览器存储空间。') } }
 
   const rememberPersonnel = () => {
     const next = { leads: addUnique(personnel.leads, fields.continuingLead), executors: addUnique(personnel.executors, fields.continuingExecutor) }
-    setPersonnel(next); localStorage.setItem('personnelHistory', JSON.stringify(next))
+    setPersonnel(next); try { localStorage.setItem('personnelHistory', JSON.stringify(next)) } catch { /* Archiving does not depend on optional personnel suggestions. */ }
   }
 
-  const copyReport = async () => {
-    await navigator.clipboard.writeText(report); rememberPersonnel(); setCopied(true); setTimeout(() => setCopied(false), 1600)
+  const archive = () => {
+    if (saved) { setNotice('当前内容已经归档，可在“已完成记录”中查看。'); return true }
+    if (requiredMissingItems.length) { setNotice(`还有 ${requiredMissingItems.length} 项必须补充，补齐后才能完成归档。`); jumpTo(requiredMissingItems[0].key); return false }
+    try {
+      const record = createRecord(fields,raw,report,meta,overrides,sourceId)
+      store.save(record); setSavedSignature(signature); rememberPersonnel()
+      setNotice(store.session?'已在本机完成归档，正在同步云端；同步结果见存储状态。':'已完成归档并保存到本机。连接云端并登录后，可将本机记录导入账号。')
+      void store.sync()
+      return true
+    } catch(e) { setNotice(e instanceof Error?e.message:'归档失败，请重试。'); return false }
   }
-  const reset = () => { setRaw(''); setFields({ ...emptyFields }); setMeta({ inferred:new Set(), notes:[], dateConfidence:{} }); setParsedOnce(false) }
+  const copyReport = async () => {
+    if (!requiredMissingItems.length && !archive()) return
+    try {
+      await navigator.clipboard.writeText(report); rememberPersonnel(); setCopied(true); setTimeout(() => setCopied(false), 1600)
+      if (requiredMissingItems.length) setNotice('已复制草稿，必填项尚未补齐，本次未归档。')
+    } catch { setNotice('剪贴板写入失败，请从成稿区手动选择复制。若已归档，记录仍保留。') }
+  }
+  const reset = () => {
+    if (parsedOnce && !saved && !window.confirm('当前内容尚未归档，确定新建一笔？')) return
+    setRaw(''); setFields({ ...emptyFields }); setMeta({ inferred:new Set(), notes:[], dateConfidence:{} }); setParsedOnce(false); setSavedSignature(''); setSourceId(undefined); setNotice('')
+  }
+  const editRecord = (record:BondRecord) => {
+    if (parsedOnce && !saved && !window.confirm('当前表单尚未归档，确定载入历史记录？')) return
+    setFields({ ...record.fields }); setRaw(record.raw); setMeta({ ...record.meta,inferred:new Set(record.meta.inferred) }); setOverrides(structuredClone(record.calendar))
+    setParsedOnce(true); setSourceId(record.id); setSavedSignature(''); setNotice('已载入历史快照。修改并完成归档后会另存新记录，原记录保留。')
+    window.scrollTo({ top:0,behavior:'smooth' })
+  }
   const jumpTo = (key: keyof BondFields) => document.getElementById(`field-${String(key)}`)?.scrollIntoView({behavior:'smooth', block:'center'})
 
   return <div className="app-shell">
     <div className="topbar">
       <div className="brand"><div className="brand-mark">GT</div><div><b>债融承做工作台</b><span>BOOKBUILDING OPERATIONS</span></div></div>
-      <div className="topbar-actions"><span className="privacy-dot"><i></i>本地计算</span><button className="ghost-btn" onClick={reset}>新建一笔</button></div>
+      <div className="topbar-actions"><span className="privacy-dot"><i></i>{store.session?store.syncing?'同步中':store.pending?`${store.pending}笔待同步`:'云端已连接':'本机存储'}</span><a className="ghost-btn" href="#archives">历史记录 {store.records.length}</a><button className="ghost-btn" onClick={reset}>新建一笔</button></div>
     </div>
 
     <main>
       <section className="hero">
-        <div><p className="eyebrow">内部报备 · 发行后管理</p><h1>债券簿记内部报备生成器 <small>v2.1</small></h1><p className="hero-copy">粘贴簿记结果，自动识别核心要素、推算关键日期，并按固定内部口径生成报备文本。</p></div>
+        <div><p className="eyebrow">内部报备 · 发行后管理</p><h1>债券簿记内部报备生成器 <small>v3.0</small></h1><p className="hero-copy">粘贴结果、核对成稿、完成归档。历史记录随时查看并导出 Excel。</p></div>
         <div className="status-chip"><span className={hasEstimated?'amber':'green'}></span>{hasEstimated?'存在暂估日期':'工作日日历已核验'}</div>
       </section>
+
+      {store.error && <div className="storage-error" role="alert">{store.error}<a href="#cloud-settings">查看云端设置</a><button className="text-btn" onClick={()=>{try {downloadBlob(new Blob([JSON.stringify({owner:store.owner,raw:localStorage.getItem(recordStorageKey(store.owner))})],{type:'application/json'}),'本机原始存储备份.json')}catch{setNotice('原始备份读取失败，请保留当前浏览器数据。')}}}>导出本机原始备份</button></div>}
+      {notice && <div className="notice-banner" role="status">{notice}</div>}
+      <CloudPanel store={store}/>
 
       <section className="kpi-grid">
         <div className="kpi"><span>要素识别率</span><strong>{parsedOnce ? `${recognitionRate}%` : '—'}</strong><div className="progress"><i style={{width:`${parsedOnce?recognitionRate:0}%`}} /></div></div>
@@ -162,12 +209,15 @@ function App() {
           </div>
 
           <div className="dashboard-card preview-card">
-            <div className="card-head preview-head"><div><span className="step-pill">03</span><h2>实时成稿</h2></div><button className="primary compact" onClick={copyReport}>{copied?'已复制 ✓':'复制报备'}</button></div>
+            <div className="card-head preview-head"><div><span className="step-pill">03</span><h2>实时成稿</h2></div><button className="secondary compact" onClick={()=>void copyReport()}>{copied?'已复制 ✓':requiredMissingItems.length?'复制草稿':'复制并归档'}</button></div>
             <div className="report-preview">{report}</div>
-            <div className="preview-note">复制报备时会自动记住本次“存续期负责人 / 执行人员”，供下次直接选择。</div>
+            <button className="primary archive-submit" disabled={!store.ready || saved} onClick={archive}>{saved?'已归档 ✓':'完成并归档'}</button>
+            <div className="preview-note">完整成稿复制时会自动归档；也可直接完成归档。继续编辑历史记录会另存新快照。</div>
           </div>
         </aside>
       </section>
+
+      <ArchivePanel store={store} onEdit={editRecord}/>
 
       <details className="dashboard-card settings">
         <summary><div><span className="step-pill muted">⚙</span><b>工作日历设置</b><span>法定节假日 / 调休补班 / 暂估年度</span></div><i>展开</i></summary>
